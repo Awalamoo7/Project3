@@ -1,0 +1,38 @@
+services:
+  app:
+    build: .
+    image: baylis-market-data:latest
+    ports:
+      - "8080:8080"
+    env_file:
+      - .env
+    environment:
+      # Inside the compose network, Redis is reached by service name, not
+      # localhost — overrides whatever REDIS_URL is set to in .env for
+      # local (non-docker) development.
+      REDIS_URL: redis://redis:6379
+    depends_on:
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:8080/health"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 5s
+    networks:
+      - baylis-net
+
+  redis:
+    image: redis:alpine
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    networks:
+      - baylis-net
+
+networks:
+  baylis-net:
+    driver: bridge

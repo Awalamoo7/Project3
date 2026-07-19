@@ -1,0 +1,5 @@
+.env
+.git
+tmp
+*.md
+go.sum
