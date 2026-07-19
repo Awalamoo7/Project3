@@ -1,0 +1,9 @@
+.env
+
+# Build artifacts
+/bin/
+*.exe
+
+# Go tooling
+*.test
+*.out
