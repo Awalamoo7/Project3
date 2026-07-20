@@ -73,3 +73,19 @@ func (c *PriceCache) SetPriceList(exchange string, quotes []model.NormalisedQuot
 		log.Printf("cache: set price list for %s: %v", exchange, err)
 	}
 }
+
+// GetFloat returns the cached value at key. Unlike GetPriceList, it
+// returns the raw error (including redis.Nil on a miss) rather than
+// swallowing it, since callers need to tell "missing" apart from "cached"
+// to decide whether to refresh from a live source.
+func (c *PriceCache) GetFloat(key string) (float64, error) {
+	return c.client.Get(context.Background(), key).Float64()
+}
+
+// SetFloat caches value at key with the given TTL. Failures are logged,
+// never panicked or returned, matching SetPriceList's behaviour.
+func (c *PriceCache) SetFloat(key string, value float64, ttl time.Duration) {
+	if err := c.client.Set(context.Background(), key, value, ttl).Err(); err != nil {
+		log.Printf("cache: set float %s: %v", key, err)
+	}
+}

@@ -8,6 +8,7 @@ package mansa
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -16,7 +17,10 @@ import (
 	"sync"
 	"time"
 
+	"github.com/redis/go-redis/v9"
+
 	"baylis-market-data/internal/adapter"
+	"baylis-market-data/internal/cache"
 	"baylis-market-data/internal/model"
 )
 
@@ -24,9 +28,12 @@ const (
 	mansaBaseURL        = "https://mansaapi.com"
 	openExchangeBaseURL = "https://openexchangerates.org/api"
 	requestTimeout      = 10 * time.Second
-	fxCacheTTL          = 5 * time.Minute
-	priceListPageSize   = 100
-	maxPriceListPages   = 20
+	fxCacheTTL          = 10 * time.Minute
+	// 500 comfortably covers a single exchange's full listing in one call
+	// (confirmed NGX's 146 stocks come back in one page at this size),
+	// so a scheduled fetch costs one Mansa call instead of several.
+	priceListPageSize = 500
+	maxPriceListPages = 20
 )
 
 var _ adapter.MarketDataAdapter = (*Adapter)(nil)
@@ -37,19 +44,27 @@ type Adapter struct {
 	apiKey            string
 	openExchangeAppID string
 	httpClient        *http.Client
+	cache             *cache.PriceCache
 
+	// lastFXRates is an in-process fallback used only when Open Exchange
+	// Rates is unreachable and the Redis-cached rate has expired; it has
+	// no TTL of its own, so it can serve a rate older than fxCacheTTL
+	// rather than fail the request outright.
 	fxMu        sync.Mutex
-	fxRates     map[string]float64
-	fxFetchedAt time.Time
+	lastFXRates map[string]float64
 }
 
 // New builds a Mansa adapter. apiKey authenticates against Mansa Markets;
-// openExchangeAppID authenticates against Open Exchange Rates.
-func New(apiKey, openExchangeAppID string) *Adapter {
+// openExchangeAppID authenticates against Open Exchange Rates; priceCache
+// backs the FX rate cache (key "fx:{currency}:GBP", 10 minute TTL) so
+// Open Exchange Rates is never called more than once per currency per
+// 10 minutes.
+func New(apiKey, openExchangeAppID string, priceCache *cache.PriceCache) *Adapter {
 	return &Adapter{
 		apiKey:            apiKey,
 		openExchangeAppID: openExchangeAppID,
 		httpClient:        &http.Client{Timeout: requestTimeout},
+		cache:             priceCache,
 	}
 }
 
@@ -255,51 +270,82 @@ func (a *Adapter) toNormalisedQuote(s mansaStock, exchange, currency string) mod
 }
 
 // fxRateToGBP returns the multiplier that converts an amount in currency
-// into GBP, using cached Open Exchange Rates data (free-tier, USD-based).
+// into GBP. It checks the Redis-backed cache first (key "fx:{currency}:GBP",
+// 10 minute TTL) and only calls Open Exchange Rates on a miss/expiry —
+// so OXR is called at most once per currency per 10 minutes. If that call
+// fails, it falls back to the last rate this adapter successfully fetched
+// rather than failing the quote outright.
 func (a *Adapter) fxRateToGBP(currency string) (float64, error) {
 	if currency == "GBP" {
 		return 1, nil
 	}
 
-	rates, err := a.latestRates()
+	cacheKey := fxCacheKey(currency)
+
+	if rate, err := a.cache.GetFloat(cacheKey); err == nil {
+		return rate, nil
+	} else if !errors.Is(err, redis.Nil) {
+		log.Printf("mansa: fx cache read for %s failed: %v", currency, err)
+	}
+
+	rate, err := a.fetchFXRate(currency)
 	if err != nil {
+		if last, ok := a.lastKnownFXRate(currency); ok {
+			log.Printf("mansa: WARNING: open exchange rates unavailable for %s (%v), using last known rate %v", currency, err, last)
+			return last, nil
+		}
 		return 0, err
 	}
 
-	usdToCurrency, ok := rates[currency]
+	a.cache.SetFloat(cacheKey, rate, fxCacheTTL)
+	a.setLastKnownFXRate(currency, rate)
+	return rate, nil
+}
+
+func fxCacheKey(currency string) string {
+	return fmt.Sprintf("fx:%s:GBP", currency)
+}
+
+func (a *Adapter) lastKnownFXRate(currency string) (float64, bool) {
+	a.fxMu.Lock()
+	defer a.fxMu.Unlock()
+	rate, ok := a.lastFXRates[currency]
+	return rate, ok
+}
+
+func (a *Adapter) setLastKnownFXRate(currency string, rate float64) {
+	a.fxMu.Lock()
+	defer a.fxMu.Unlock()
+	if a.lastFXRates == nil {
+		a.lastFXRates = make(map[string]float64)
+	}
+	a.lastFXRates[currency] = rate
+}
+
+// fetchFXRate calls Open Exchange Rates for the full USD-based rate table
+// and derives the currency->GBP multiplier from it.
+func (a *Adapter) fetchFXRate(currency string) (float64, error) {
+	reqURL := fmt.Sprintf("%s/latest.json?app_id=%s", openExchangeBaseURL, url.QueryEscape(a.openExchangeAppID))
+
+	var oxr openExchangeRatesResponse
+	if err := a.getJSON(reqURL, nil, &oxr); err != nil {
+		return 0, fmt.Errorf("open exchange rates: %w", err)
+	}
+	if len(oxr.Rates) == 0 {
+		return 0, fmt.Errorf("open exchange rates: empty rates response")
+	}
+
+	usdToCurrency, ok := oxr.Rates[currency]
 	if !ok || usdToCurrency == 0 {
 		return 0, fmt.Errorf("no FX rate available for %s", currency)
 	}
-	usdToGBP, ok := rates["GBP"]
+	usdToGBP, ok := oxr.Rates["GBP"]
 	if !ok || usdToGBP == 0 {
 		return 0, fmt.Errorf("no FX rate available for GBP")
 	}
 
 	// rates are USD->currency, so USD->GBP / USD->currency = currency->GBP.
 	return usdToGBP / usdToCurrency, nil
-}
-
-func (a *Adapter) latestRates() (map[string]float64, error) {
-	a.fxMu.Lock()
-	defer a.fxMu.Unlock()
-
-	if a.fxRates != nil && time.Since(a.fxFetchedAt) < fxCacheTTL {
-		return a.fxRates, nil
-	}
-
-	reqURL := fmt.Sprintf("%s/latest.json?app_id=%s", openExchangeBaseURL, url.QueryEscape(a.openExchangeAppID))
-
-	var oxr openExchangeRatesResponse
-	if err := a.getJSON(reqURL, nil, &oxr); err != nil {
-		return nil, fmt.Errorf("open exchange rates: %w", err)
-	}
-	if len(oxr.Rates) == 0 {
-		return nil, fmt.Errorf("open exchange rates: empty rates response")
-	}
-
-	a.fxRates = oxr.Rates
-	a.fxFetchedAt = time.Now()
-	return a.fxRates, nil
 }
 
 // getMansaJSON performs an authenticated GET against Mansa. It always

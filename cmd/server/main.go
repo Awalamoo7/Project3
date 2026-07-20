@@ -39,8 +39,8 @@ func main() {
 	}
 	defer redisClient.Close()
 
-	var marketData adapter.MarketDataAdapter = mansa.New(cfg.MansaAPIKey, cfg.OpenExchangeAppID)
 	priceCache := cache.New(redisClient)
+	var marketData adapter.MarketDataAdapter = mansa.New(cfg.MansaAPIKey, cfg.OpenExchangeAppID, priceCache)
 
 	go worker.New(marketData, priceCache).Run(ctx)
 
